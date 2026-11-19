@@ -64,12 +64,44 @@ const answerChain = ChatPromptTemplate.fromMessages([
   .pipe(new StringOutputParser());
 
 const retrieveDoctorIds = async (searchQuery: string) => {
-  const results = await vectorStore.similaritySearchWithScore(
-    searchQuery,
-    TOP_K_DOCTORS,
-  );
+  try {
+    const results = await vectorStore.similaritySearchWithScore(
+      searchQuery,
+      TOP_K_DOCTORS,
+    );
 
-  return results.map(([document]) => document.metadata.doctorId as string);
+    const ids = results
+      .map(([document]) => document.metadata?.doctorId as string)
+      .filter(Boolean);
+
+    if (ids.length) {
+      return ids;
+    }
+  } catch (error) {
+    console.error("Vector similarity search error:", error);
+  }
+
+  // Fallback keyword search across approved doctors
+  const terms = searchQuery.split(/\s+/).filter((w) => w.length > 2);
+  if (!terms.length) {
+    return [];
+  }
+
+  const fallbackDoctors = await prisma.doctor.findMany({
+    where: {
+      isDeleted: false,
+      verificationStatus: DoctorVerificationStatus.APPROVED,
+      OR: terms.flatMap((term) => [
+        { specialization: { contains: term, mode: "insensitive" } },
+        { bio: { contains: term, mode: "insensitive" } },
+        { name: { contains: term, mode: "insensitive" } },
+      ]),
+    },
+    take: TOP_K_DOCTORS,
+    select: { id: true },
+  });
+
+  return fallbackDoctors.map((d) => d.id);
 };
 
 const getDoctorsWithTodaysSchedules = async (doctorIds: string[]) => {
