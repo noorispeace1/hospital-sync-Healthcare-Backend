@@ -7,5 +7,10 @@ export const redisClient = createClient({
 	socket: {
 		host: config.redis_host,
 		port: Number(config.redis_port),
+		reconnectStrategy: (retries) => Math.min(retries * 100, 3000),
 	},
+});
+
+redisClient.on("error", (error) => {
+	console.error("Redis Client Error (handled):", error?.message || error);
 });

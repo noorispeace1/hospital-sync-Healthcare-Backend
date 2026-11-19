@@ -7,17 +7,6 @@ import { AppError } from "./AppError";
 
 export const seedSuperAdmin = async () => {
 	try {
-		const isSuperAdminExist = await prisma.user.findFirst({
-			where: {
-				role: Role.SUPER_ADMIN,
-			},
-		});
-
-		if (isSuperAdminExist) {
-			console.log("Super Admin Already Exists!");
-			return;
-		}
-
 		const name = config.super_admin_name;
 		const email = config.super_admin_email;
 		const password = config.super_admin_password;
@@ -27,6 +16,33 @@ export const seedSuperAdmin = async () => {
 				httpStatus.INTERNAL_SERVER_ERROR,
 				"Super Admin Name , Email, Password Missing In Env File!!!",
 			);
+		}
+
+		const isSuperAdminExist = await prisma.user.findFirst({
+			where: {
+				role: Role.SUPER_ADMIN,
+			},
+		});
+
+		if (isSuperAdminExist) {
+			if (isSuperAdminExist.email !== email) {
+				const hashedPassword = await bcrypt.hash(
+					password,
+					Number(config.bcrypt_salt_rounds),
+				);
+				await prisma.user.update({
+					where: { id: isSuperAdminExist.id },
+					data: {
+						email,
+						name,
+						password: hashedPassword,
+					},
+				});
+				console.log(`Super Admin updated to email: ${email}`);
+			} else {
+				console.log("Super Admin Already Exists!");
+			}
+			return;
 		}
 
 		const hashedPassword = await bcrypt.hash(
@@ -48,12 +64,6 @@ export const seedSuperAdmin = async () => {
 		console.log("Super Admin Created : ", superAdmin);
 	} catch (error) {
 		console.log("Error Seeding Super Admin : ", error);
-
-		await prisma.user.delete({
-			where: {
-				email: config.super_admin_email,
-			},
-		});
 	}
 };
 
