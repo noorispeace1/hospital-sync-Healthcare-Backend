@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { addMinutes, isBefore, isSameDay, subHours } from "date-fns";
 import httpStatus from "http-status";
 import PDFDocument from "pdfkit";
@@ -142,23 +143,50 @@ const bookAppointment = async (payload: IBookAppointmentPayload , user: RequestU
 
 		const bkashCreatePaymentResult = await bkashCreatePaymentResponse.json();
 
+		let paymentID: string | undefined = bkashCreatePaymentResult?.paymentID;
+		let paymentUrl: string | undefined = bkashCreatePaymentResult?.bkashURL;
+		let merchantInvoiceNumber: string =
+			bkashCreatePaymentResult?.merchantInvoiceNumber || appointment.id;
+
+		// If bKash sandbox rejects unregistered local callback URL (error 2049),
+		// seamlessly route to our built-in bKash Sandbox Checkout screen.
+		if (!paymentUrl || !paymentID) {
+			if (config.node_env === "development") {
+				paymentID = `BKASH_SANDBOX_${crypto.randomBytes(6).toString("hex").toUpperCase()}`;
+				merchantInvoiceNumber = appointment.id;
+				const params = new URLSearchParams({
+					paymentID,
+					appointmentId: appointment.id,
+					amount,
+					doctor: schedule.doctor.name,
+				});
+				paymentUrl = `${config.frontend_url}/checkout/bkash-sandbox?${params.toString()}`;
+			} else {
+				throw new AppError(
+					httpStatus.BAD_GATEWAY,
+					bkashCreatePaymentResult?.statusMessage ||
+						"Failed to initialize bKash checkout session",
+				);
+			}
+		}
+
 		//paymen model create
 
 		await tx.payment.create({
 			data: {
-				merchantInvoiceNumber: bkashCreatePaymentResult.merchantInvoiceNumber,
+				merchantInvoiceNumber,
 				appointmentId: appointment.id,
 				amount: amount,
 				gatewayResponse: bkashCreatePaymentResult,
-				bkashPaymentId: bkashCreatePaymentResult.paymentID,
+				bkashPaymentId: paymentID,
 				payerReference: user.email,
 			},
 		});
 
 		return {
-			paymentUrl: bkashCreatePaymentResult.bkashURL,
+			paymentUrl,
 		};
-	});
+	}, { timeout: 30000 });
 
 	return transactionResult;
 };
@@ -233,20 +261,45 @@ const payAppointment = async (payload: IPayAppointmentPayload, user: RequestUser
 
 	const bkashCreatePaymentResult = await bkashCreatePaymentResponse.json();
 
+	let paymentID: string | undefined = bkashCreatePaymentResult?.paymentID;
+	let paymentUrl: string | undefined = bkashCreatePaymentResult?.bkashURL;
+	let merchantInvoiceNumber: string =
+		bkashCreatePaymentResult?.merchantInvoiceNumber || existingAppointment.id;
+
+	if (!paymentUrl || !paymentID) {
+		if (config.node_env === "development") {
+			paymentID = `BKASH_SANDBOX_${crypto.randomBytes(6).toString("hex").toUpperCase()}`;
+			merchantInvoiceNumber = existingAppointment.id;
+			const params = new URLSearchParams({
+				paymentID,
+				appointmentId: existingAppointment.id,
+				amount,
+				doctor: existingAppointment.schedule.doctor.name,
+			});
+			paymentUrl = `${config.frontend_url}/checkout/bkash-sandbox?${params.toString()}`;
+		} else {
+			throw new AppError(
+				httpStatus.BAD_GATEWAY,
+				bkashCreatePaymentResult?.statusMessage ||
+					"Failed to initialize bKash checkout session",
+			);
+		}
+	}
+
 	await prisma.payment.update({
 		where: {
 			appointmentId: existingAppointment.id,
 		},
 
 		data: {
-			merchantInvoiceNumber: bkashCreatePaymentResult.merchantInvoiceNumber,
+			merchantInvoiceNumber,
 			gatewayResponse: bkashCreatePaymentResult,
-			bkashPaymentId: bkashCreatePaymentResult.paymentID,
+			bkashPaymentId: paymentID,
 		},
 	});
 
 	return {
-		paymentUrl: bkashCreatePaymentResult.bkashURL,
+		paymentUrl,
 	};
 };
 
@@ -264,30 +317,49 @@ const bookAppointmentCallback = async (query: Record<string, any>) => {
 			throw new AppError(httpStatus.BAD_REQUEST, "Payment Status is Missing");
 		}
 
-		const bkashIdToken = await getBkashIdToken();
+		let executedPaymentResult: Record<string, any>;
 
-		if (!bkashIdToken) {
-			throw new AppError(httpStatus.BAD_GATEWAY, "No Bkash Access Token Found!");
-		}
+		if (String(paymentId).startsWith("BKASH_SANDBOX_")) {
+			const sandboxPayment = await tx.payment.findUnique({
+				where: { bkashPaymentId: paymentId },
+			});
+			if (!sandboxPayment) {
+				throw new AppError(httpStatus.NOT_FOUND, "Sandbox Payment Record Not Found");
+			}
+			executedPaymentResult = {
+				paymentID: paymentId,
+				merchantInvoiceNumber: sandboxPayment.merchantInvoiceNumber,
+				amount: sandboxPayment.amount.toString(),
+				trxID: `BKS${crypto.randomBytes(4).toString("hex").toUpperCase()}`,
+				paymentExecuteTime: new Date().toISOString(),
+				transactionStatus: status === "success" ? "Completed" : status,
+			};
+		} else {
+			const bkashIdToken = await getBkashIdToken();
 
-		const executedPaymentResponse = await fetch(
-			`${config.bkash_base_url}/tokenized/checkout/execute`,
-			{
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					Accept: "application/json",
-					Authorization: bkashIdToken,
-					"X-App-Key": config.bkash_app_key,
+			if (!bkashIdToken) {
+				throw new AppError(httpStatus.BAD_GATEWAY, "No Bkash Access Token Found!");
+			}
+
+			const executedPaymentResponse = await fetch(
+				`${config.bkash_base_url}/tokenized/checkout/execute`,
+				{
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Accept: "application/json",
+						Authorization: bkashIdToken,
+						"X-App-Key": config.bkash_app_key,
+					},
+
+					body: JSON.stringify({
+						paymentID: paymentId,
+					}),
 				},
+			);
 
-				body: JSON.stringify({
-					paymentID: paymentId,
-				}),
-			},
-		);
-
-		const executedPaymentResult = await executedPaymentResponse.json();
+			executedPaymentResult = await executedPaymentResponse.json();
+		}
 
 		if (status === "success") {
 
@@ -412,21 +484,25 @@ const bookAppointmentCallback = async (query: Record<string, any>) => {
 
 			const pdfBuffer = await pdfReadyPromise;
 
-			await transporter.sendMail({
-				from: config.email_sender,
-				to: appointment.patient.email,
-				subject: "Your Appointment Invoice - PH Healthcare System",
-				text: "Thank you for booking an appointment. Please find your invoice attached.",
-				attachments : [
-					{
-						filename: "invoice.pdf",
-						content : pdfBuffer
-					}
-				]
-			})
+			try {
+				await transporter.sendMail({
+					from: config.email_sender,
+					to: appointment.patient.email,
+					subject: "Your Appointment Invoice - PH Healthcare System",
+					text: "Thank you for booking an appointment. Please find your invoice attached.",
+					attachments: [
+						{
+							filename: "invoice.pdf",
+							content: pdfBuffer,
+						},
+					],
+				});
+			} catch (mailError) {
+				console.error("Failed to send appointment invoice email:", mailError);
+			}
 
 			return {
-				redirectUrl: `${config.frontend_url}/dashboard/my-appointments?status=success`,
+				redirectUrl: `${config.frontend_url}/checkout/status?status=success&appointmentId=${appointment.id}`,
 			};
 		} else if (status === "failure") {
 			await tx.payment.update({
@@ -439,7 +515,7 @@ const bookAppointmentCallback = async (query: Record<string, any>) => {
 				},
 			});
 			return {
-				redirectUrl: `${config.frontend_url}/dashboard/my-appointments?status=failue`,
+				redirectUrl: `${config.frontend_url}/checkout/status?status=failure`,
 			};
 		} else if (status === "cancel") {
 			await tx.payment.update({
@@ -452,13 +528,11 @@ const bookAppointmentCallback = async (query: Record<string, any>) => {
 				},
 			});
 			return {
-				executedPaymentResult,
-				redirectUrl: `${config.frontend_url}/dashboard/my-appointments?status=cancel`,
+				redirectUrl: `${config.frontend_url}/checkout/status?status=cancel`,
 			};
 		} else {
 			return {
-				executedPaymentResult,
-				redirectUrl: `${config.frontend_url}/dashboard/my-appointments?error=payment-failed`,
+				redirectUrl: `${config.frontend_url}/checkout/status?status=failure`,
 			};
 		}
 	}, {

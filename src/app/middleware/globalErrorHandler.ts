@@ -10,9 +10,22 @@ export const globalErrorHandler = async (
 	res: Response,
 	_next: NextFunction,
 ) => {
-	// if (config.node_env === "development") {
-		console.log("Error from Global Error Handler", err);
-	// }
+	// Expected client errors (401/403/404 etc. thrown as AppError) are normal flow.
+	// Suppress routine unauthenticated session checks on /auth/me to keep dev logs clean.
+	const isAuthMeCheck =
+		err instanceof AppError &&
+		err.statusCode === httpStatus.UNAUTHORIZED &&
+		_req.originalUrl.includes("/auth/me");
+
+	if (isAuthMeCheck) {
+		// Normal logged-out session check; no console spam needed.
+	} else if (err instanceof AppError && err.statusCode < 500) {
+		if (config.node_env === "development") {
+			console.warn(`[${err.statusCode}] ${_req.method} ${_req.originalUrl} - ${err.message}`);
+		}
+	} else {
+		console.error("Error from Global Error Handler", err);
+	}
 
 	let statusCode: number = httpStatus.INTERNAL_SERVER_ERROR;
 	let errorMessage = err.message || "Internal Server Error";
